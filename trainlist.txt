@@ -1,0 +1,16 @@
+python train.py --cfg yolov5s.yaml --device 0 --name yolov5s
+python train.py --cfg yolov5ssimppf.yaml --device 1 --name yolov5ssimppf
+
+
+python -m torch.distributed.run --nproc_per_node 2 train.py --name yolov5scc --cfg yolov5scc.yaml  --batch 32 --data cocopest.yaml --device 0,1;
+python -m torch.distributed.run --nproc_per_node 2 train.py --name yolov5sgam --cfg yolov5sgam.yaml  --batch 32 --data cocopest.yaml --device 0,1;
+python -m torch.distributed.run --nproc_per_node 2 train.py --name yolov5snam --cfg yolov5snam.yaml  --batch 32 --data cocopest.yaml --device 0,1;
+python -m torch.distributed.run --nproc_per_node 2 train.py --name yolov5ssimam --cfg yolov5ssimam.yaml  --batch 32 --data cocopest.yaml --device 0,1;
+python -m torch.distributed.run --nproc_per_node 2 train.py --name yolov5ss2a --cfg yolov5ss2a.yaml  --batch 32 --data cocopest.yaml --device 0,1
+
+
+python train.py --name yolov5sgam --cfg yolov5sgam.yaml --device 0;python train.py --name yolov5snam --cfg yolov5snam.yaml --device 0
+python train.py --name yolov5ssimam --cfg yolov5ssimam.yaml --device 1;python train.py --name yolov5ss2a --cfg yolov5ss2a.yaml --device 1
+models/yolov5ssimam.yaml
+
+python train.py --name yolov5scc --cfg yolov5scc.yaml --device 0;

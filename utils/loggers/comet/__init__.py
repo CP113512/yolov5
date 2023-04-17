@@ -176,6 +176,7 @@ class CometLogger:
                 if experiment_id is not None:
                     return comet_ml.ExistingExperiment(
                         previous_experiment=experiment_id,
+
                         **self.default_experiment_kwargs,
                     )
 
@@ -391,6 +392,7 @@ class CometLogger:
 
     def on_train_start(self):
         self.log_parameters(self.hyp)
+        self.experiment.set_name(self.opt.name)
 
     def on_train_epoch_start(self):
         return

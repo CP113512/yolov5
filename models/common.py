@@ -21,6 +21,8 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+
+from torch.nn import Softmax
 from PIL import Image
 from torch.cuda import amp
 
@@ -32,6 +34,314 @@ from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suff
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, smart_inference_mode
 
+class CARAFE(nn.Module):
+    def __init__(self, c, k_enc=3, k_up=5, c_mid=64, scale=2):
+        """ The unofficial implementation of the CARAFE module.
+        The details are in "https://arxiv.org/abs/1905.02188".
+        Args:
+            c: The channel number of the input and the output.
+            c_mid: The channel number after compression.
+            scale: The expected upsample scale.
+            k_up: The size of the reassembly kernel.
+            k_enc: The kernel size of the encoder.
+        Returns:
+            X: The upsampled feature map.
+        """
+        super(CARAFE, self).__init__()
+        self.scale = scale
+
+        self.comp = Conv(c, c_mid)
+        self.enc = Conv(c_mid, (scale*k_up)**2, k=k_enc, act=False)
+        self.pix_shf = nn.PixelShuffle(scale)
+
+        self.upsmp = nn.Upsample(scale_factor=scale, mode='nearest')
+        self.unfold = nn.Unfold(kernel_size=k_up, dilation=scale, 
+                                padding=k_up//2*scale)
+
+    def forward(self, X):
+        b, c, h, w = X.size()
+        h_, w_ = h * self.scale, w * self.scale
+        
+        W = self.comp(X)                                # b * m * h * w
+        W = self.enc(W)                                 # b * 100 * h * w
+        W = self.pix_shf(W)                             # b * 25 * h_ * w_
+        W = torch.softmax(W, dim=1)                         # b * 25 * h_ * w_
+
+        X = self.upsmp(X)                               # b * c * h_ * w_
+        X = self.unfold(X)                              # b * 25c * h_ * w_
+        X = X.view(b, c, -1, h_, w_)                    # b * 25 * c * h_ * w_
+
+        X = torch.einsum('bkhw,bckhw->bchw', [W, X])    # b * c * h_ * w_
+        return X
+
+class SimConv(nn.Module):
+    '''Normal Conv with ReLU activation'''
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups=1, bias=False):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=bias,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def forward_fuse(self, x):
+        return self.act(self.conv(x))
+
+class SimSPPF(nn.Module):
+    '''Simplified SPPF with ReLU activation'''
+    def __init__(self, in_channels, out_channels, kernel_size=5):
+        super().__init__()
+        c_ = in_channels // 2  # hidden channels
+        self.cv1 = SimConv(in_channels, c_, 1, 1)
+        self.cv2 = SimConv(c_ * 4, out_channels, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+
+class SimAM(torch.nn.Module):
+    def __init__(self, channels = None,out_channels = None, e_lambda = 1e-4):
+        super(SimAM, self).__init__()
+
+        self.activaton = nn.Sigmoid()
+        self.e_lambda = e_lambda
+
+    def __repr__(self):
+        s = self.__class__.__name__ + '('
+        s += ('lambda=%f)' % self.e_lambda)
+        return s
+
+    @staticmethod
+    def get_module_name():
+        return "simam"
+
+    def forward(self, x):
+
+        b, c, h, w = x.size()
+        
+        n = w * h - 1
+
+        x_minus_mu_square = (x - x.mean(dim=[2,3], keepdim=True)).pow(2)
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2,3], keepdim=True) / n + self.e_lambda)) + 0.5
+
+        return x * self.activaton(y)
+
+def spatial_shift1(x):
+    b,w,h,c = x.size()
+    x[:,1:,:,:c//4] = x[:,:w-1,:,:c//4]
+    x[:,:w-1,:,c//4:c//2] = x[:,1:,:,c//4:c//2]
+    x[:,:,1:,c//2:c*3//4] = x[:,:,:h-1,c//2:c*3//4]
+    x[:,:,:h-1,3*c//4:] = x[:,:,1:,3*c//4:]
+    return x
+
+class Channel_Att(nn.Module):
+    def __init__(self, channels, t=16):
+        super(Channel_Att, self).__init__()
+        self.channels = channels
+      
+        self.bn2 = nn.BatchNorm2d(self.channels, affine=True)
+
+
+    def forward(self, x):
+        residual = x
+
+        x = self.bn2(x)
+        weight_bn = self.bn2.weight.data.abs() / torch.sum(self.bn2.weight.data.abs())
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = torch.mul(weight_bn, x)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        
+        x = torch.sigmoid(x) * residual #
+        
+        return x
+
+class GAMAttention(nn.Module):
+       #https://paperswithcode.com/paper/global-attention-mechanism-retain-information
+    def __init__(self, c1, c2, group=True,rate=4):
+        super(GAMAttention, self).__init__()
+        
+        self.channel_attention = nn.Sequential(
+            nn.Linear(c1, int(c1 / rate)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(c1 / rate), c1)
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(c1, c1//rate, kernel_size=7, padding=3,groups=rate)if group else nn.Conv2d(c1, int(c1 / rate), kernel_size=7, padding=3), 
+            nn.BatchNorm2d(int(c1 /rate)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1//rate, c2, kernel_size=7, padding=3,groups=rate) if group else nn.Conv2d(int(c1 / rate), c2, kernel_size=7, padding=3), 
+            nn.BatchNorm2d(c2)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)
+        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)
+        x_channel_att = x_att_permute.permute(0, 3, 1, 2)
+        x = x * x_channel_att
+ 
+        x_spatial_att = self.spatial_attention(x).sigmoid()
+        x_spatial_att=channel_shuffle(x_spatial_att,4) #last shuffle 
+        out = x * x_spatial_att
+        return out  
+
+def channel_shuffle(x, groups=2):   ##shuffle channel 
+        #RESHAPE----->transpose------->Flatten 
+        B, C, H, W = x.size()
+        out = x.view(B, groups, C // groups, H, W).permute(0, 2, 1, 3, 4).contiguous()
+        out=out.view(B, C, H, W) 
+        return out
+
+def INF(B,H,W):
+     return -torch.diag(torch.tensor(float("inf")).repeat(H),0).unsqueeze(0).repeat(B*W,1,1)
+
+class C2F_Bottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):  # ch_in, ch_out, shortcut, groups, kernels, expand
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class C2f(nn.Module):
+    # CSP Bottleneck with 2 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(C2F_Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class CrissCrossAttention(nn.Module):
+    """ Criss-Cross Attention Module"""
+    def __init__(self, in_dim):
+        super(CrissCrossAttention,self).__init__()
+        self.query_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim//8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim//8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
+        self.softmax = Softmax(dim=3)
+        self.INF = INF
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+
+    def forward(self, x):
+        m_batchsize, _, height, width = x.size()
+        proj_query = self.query_conv(x)
+        proj_query_H = proj_query.permute(0,3,1,2).contiguous().view(m_batchsize*width,-1,height).permute(0, 2, 1)
+        proj_query_W = proj_query.permute(0,2,1,3).contiguous().view(m_batchsize*height,-1,width).permute(0, 2, 1)
+        proj_key = self.key_conv(x)
+        proj_key_H = proj_key.permute(0,3,1,2).contiguous().view(m_batchsize*width,-1,height)
+        proj_key_W = proj_key.permute(0,2,1,3).contiguous().view(m_batchsize*height,-1,width)
+        proj_value = self.value_conv(x)
+        proj_value_H = proj_value.permute(0,3,1,2).contiguous().view(m_batchsize*width,-1,height)
+        proj_value_W = proj_value.permute(0,2,1,3).contiguous().view(m_batchsize*height,-1,width)
+        energy_H = (torch.bmm(proj_query_H, proj_key_H)+self.INF(m_batchsize, height, width)).view(m_batchsize,width,height,height).permute(0,2,1,3)
+        energy_W = torch.bmm(proj_query_W, proj_key_W).view(m_batchsize,height,width,width)
+        concate = self.softmax(torch.cat([energy_H, energy_W], 3))
+
+        att_H = concate[:,:,:,0:height].permute(0,2,1,3).contiguous().view(m_batchsize*width,height,height)
+        #print(concate)
+        #print(att_H) 
+        att_W = concate[:,:,:,height:height+width].contiguous().view(m_batchsize*height,width,width)
+        out_H = torch.bmm(proj_value_H, att_H.permute(0, 2, 1)).view(m_batchsize,width,-1,height).permute(0,2,3,1)
+        out_W = torch.bmm(proj_value_W, att_W.permute(0, 2, 1)).view(m_batchsize,height,-1,width).permute(0,2,1,3)
+        #print(out_H.size(),out_W.size())
+        return self.gamma*(out_H + out_W) + x
+
+
+class NAMAttention(nn.Module):
+    def __init__(self, channels, out_channels=None, no_spatial=True):
+        super(NAMAttention, self).__init__()
+        self.Channel_Att = Channel_Att(channels)
+  
+    def forward(self, x):
+        x_out1=self.Channel_Att(x)
+ 
+        return x_out1 
+
+
+def spatial_shift2(x):
+    b,w,h,c = x.size()
+    x[:,:,1:,:c//4] = x[:,:,:h-1,:c//4]
+    x[:,:,:h-1,c//4:c//2] = x[:,:,1:,c//4:c//2]
+    x[:,1:,:,c//2:c*3//4] = x[:,:w-1,:,c//2:c*3//4]
+    x[:,:w-1,:,3*c//4:] = x[:,1:,:,3*c//4:]
+    return x
+
+
+class SplitAttention(nn.Module):
+    def __init__(self,channel=512,k=3):
+        super().__init__()
+        self.channel=channel
+        self.k=k
+        self.mlp1=nn.Linear(channel,channel,bias=False)
+        self.gelu=nn.GELU()
+        self.mlp2=nn.Linear(channel,channel*k,bias=False)
+        self.softmax=nn.Softmax(1)
+    
+    def forward(self,x_all):
+        b,k,h,w,c=x_all.shape
+        x_all=x_all.reshape(b,k,-1,c) 
+        a=torch.sum(torch.sum(x_all,1),1) 
+        hat_a=self.mlp2(self.gelu(self.mlp1(a))) 
+        hat_a=hat_a.reshape(b,self.k,c) 
+        bar_a=self.softmax(hat_a) 
+        attention=bar_a.unsqueeze(-2) 
+        out=attention*x_all 
+        out=torch.sum(out,1).reshape(b,h,w,c)
+        return out
+
+
+class S2Attention(nn.Module):
+
+    def __init__(self, channels=512 ):
+        super().__init__()
+        self.mlp1 = nn.Linear(channels,channels*3)
+        self.mlp2 = nn.Linear(channels,channels)
+        self.split_attention = SplitAttention()
+
+    def forward(self, x):
+        b,c,w,h = x.size()
+        x=x.permute(0,2,3,1)
+        x = self.mlp1(x)
+        x1 = spatial_shift1(x[:,:,:,:c])
+        x2 = spatial_shift2(x[:,:,:,c:c*2])
+        x3 = x[:,:,:,c*2:]
+        x_all=torch.stack([x1,x2,x3],1)
+        a = self.split_attention(x_all)
+        x = self.mlp2(a)
+        x=x.permute(0,3,1,2)
+        return x
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
     # Pad to 'same' shape outputs
